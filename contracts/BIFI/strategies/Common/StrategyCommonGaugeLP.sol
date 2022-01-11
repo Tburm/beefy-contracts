@@ -192,7 +192,7 @@ contract StrategyCommonGaugeLP is StratManager, FeeManager, GasThrottler {
 
     // it calculates how much 'want' the strategy has working in the farm.
     function balanceOfPool() public view returns (uint256) {
-        uint256 _amount = IGaugeProxy(gaugeStaker).balanceOf(gaugeStaker);
+        uint256 _amount = IGaugeProxy(gauge).balanceOf(gaugeStaker);
         return _amount;
     }
 

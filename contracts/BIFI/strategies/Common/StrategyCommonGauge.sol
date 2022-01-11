@@ -26,18 +26,17 @@ contract StrategyCommonGauge is StratManager, FeeManager, GasThrottler {
     // Beefy Contracts
     address public gaugeStaker;
 
-    // Third party contracts
-    address public gauge;
-
     bool public harvestOnDeposit;
     uint256 public lastHarvest;
-    uint256 private wantHarvested;
+    uint256 public wantLocked;
     uint256 private constant WEEK = 7 * 86400;
+    uint256 private constant WEEKS_IN_YEAR = 52;
 
     // Routes
     address[] public outputToNativeRoute;
 
     event StratHarvest(address indexed harvester, uint256 wantHarvested, uint256 tvl);
+    event NotifyRewards(uint256 wantHarvested, uint256 tvl);
     event Deposit(uint256 tvl);
     event Withdraw(uint256 tvl);
 
@@ -96,14 +95,6 @@ contract StrategyCommonGauge is StratManager, FeeManager, GasThrottler {
         }
     }
 
-    function notifyRewards() external onlyOwner {
-        uint256 beforeWantBal = balanceOf();
-        depositUnderlying();
-        wantHarvested = balanceOfWant().sub(beforeWantBal);
-        lastHarvest = block.timestamp;
-        emit StratHarvest(msg.sender, wantHarvested, balanceOf());
-    }
-
     function harvest() external gasThrottle virtual {
         _harvest(tx.origin);
     }
@@ -118,19 +109,17 @@ contract StrategyCommonGauge is StratManager, FeeManager, GasThrottler {
 
     // compounds earnings and charges performance fee
     function _harvest(address callFeeRecipient) internal whenNotPaused {
-        uint256 beforeWantBal = balanceOf();
         uint256 beforeOutputBal = IERC20(output).balanceOf(address(this));
-
         IGaugeStaker(gaugeStaker).claimVeWantReward();
         uint256 outputBal = IERC20(output).balanceOf(address(this));
         require(outputBal > beforeOutputBal, "!rewards");
 
         chargeFees(callFeeRecipient);
-        depositUnderlying();
-        wantHarvested = balanceOfWant().sub(beforeWantBal);
+        uint256 depositBal = depositUnderlying();
+        wantLocked = wantLockedLeft().add(depositBal);
 
         lastHarvest = block.timestamp;
-        emit StratHarvest(msg.sender, wantHarvested, balanceOf());
+        emit StratHarvest(msg.sender, depositBal, balanceOf());
     }
 
     // performance fees
@@ -151,14 +140,15 @@ contract StrategyCommonGauge is StratManager, FeeManager, GasThrottler {
     }
 
     // Deposits underlying token to get more want.
-    function depositUnderlying() internal {
+    function depositUnderlying() internal returns (uint256) {
         uint256 outputBal = IERC20(output).balanceOf(address(this));
         IVault(want).deposit(outputBal);
+        return outputBal;
     }
 
     // calculate the total underlaying 'want' held by the strat, minus any pending rewards.
     function balanceOf() public view returns (uint256) {
-        return balanceOfWant().sub(wantLocked());
+        return balanceOfWant().sub(wantLockedLeft());
     }
 
     // it calculates how much 'want' this contract holds.
@@ -168,8 +158,8 @@ contract StrategyCommonGauge is StratManager, FeeManager, GasThrottler {
 
     // remaining want rewards not yet distributed on this contract.
     // linear distribution over 1 week.
-    function wantLocked() public view returns (uint256) {
-        return wantHarvested.mul(getMultiplier(block.timestamp, lastHarvest.add(WEEK))).div(WEEK);
+    function wantLockedLeft() public view returns (uint256) {
+        return wantLocked.mul(getMultiplier(block.timestamp, lastHarvest.add(WEEK))).div(WEEK);
     }
 
     // return reward multiplier over the given _from to _to block.
@@ -178,6 +168,11 @@ contract StrategyCommonGauge is StratManager, FeeManager, GasThrottler {
             return 0;
         }
         return _to.sub(_from);
+    }
+
+    // annual percentage rate in 18 decimals.
+    function apr() external view returns (uint256) {
+        return wantLocked.mul(1e18).div(balanceOf()).mul(WEEKS_IN_YEAR);
     }
 
     // returns rewards unharvested
@@ -214,6 +209,18 @@ contract StrategyCommonGauge is StratManager, FeeManager, GasThrottler {
 
     function setShouldGasThrottle(bool _shouldGasThrottle) external onlyManager {
         shouldGasThrottle = _shouldGasThrottle;
+    }
+
+    // notify the contract of any rewards outside of fee distribution.
+    // extend the lock for another week.
+    function notifyRewards(bool _chargeFees) external onlyManager {
+        if (_chargeFees) {
+            chargeFees(tx.origin);
+        }
+        uint256 depositBal = depositUnderlying();
+        wantLocked = wantLockedLeft().add(depositBal);
+        lastHarvest = block.timestamp;
+        emit NotifyRewards(depositBal, balanceOf());
     }
 
     // called as part of strat migration. Sends all the available funds back to the vault.

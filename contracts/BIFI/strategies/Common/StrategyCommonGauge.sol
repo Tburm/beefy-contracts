@@ -7,8 +7,8 @@ import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 import "@openzeppelin/contracts/math/SafeMath.sol";
 
 import "../../interfaces/beefy/IVault.sol";
+import "../../interfaces/beefy/IBeefyRewardPool.sol";
 import "../../interfaces/common/IUniswapRouterETH.sol";
-import "../../interfaces/common/IUniswapV2Pair.sol";
 import "../../interfaces/common/gauge/IGaugeStaker.sol";
 import "../Common/StratManager.sol";
 import "../Common/FeeManager.sol";
@@ -25,23 +25,21 @@ contract StrategyCommonGauge is StratManager, FeeManager, GasThrottler {
 
     // Beefy Contracts
     address public gaugeStaker;
+    address public rewardPool;
 
     bool public harvestOnDeposit;
     uint256 public lastHarvest;
-    uint256 public wantLocked;
-    uint256 private constant WEEK = 7 * 86400;
-    uint256 private constant WEEKS_IN_YEAR = 52;
 
     // Routes
     address[] public outputToNativeRoute;
 
     event StratHarvest(address indexed harvester, uint256 wantHarvested, uint256 tvl);
-    event NotifyRewards(uint256 wantHarvested, uint256 tvl);
     event Deposit(uint256 tvl);
     event Withdraw(uint256 tvl);
 
     constructor(
         address _want,
+        address _rewardPool,
         address _gaugeStaker,
         address _vault,
         address _unirouter,
@@ -51,6 +49,7 @@ contract StrategyCommonGauge is StratManager, FeeManager, GasThrottler {
         address[] memory _outputToNativeRoute
     ) StratManager(_keeper, _strategist, _unirouter, _vault, _beefyFeeRecipient) public {
         want = _want;
+        rewardPool = _rewardPool;
         gaugeStaker = _gaugeStaker;
 
         output = _outputToNativeRoute[0];
@@ -65,6 +64,7 @@ contract StrategyCommonGauge is StratManager, FeeManager, GasThrottler {
         uint256 wantBal = IERC20(want).balanceOf(address(this));
 
         if (wantBal > 0) {
+            IBeefyRewardPool(rewardPool).stake(wantBal);
             emit Deposit(balanceOf());
         }
     }
@@ -73,6 +73,11 @@ contract StrategyCommonGauge is StratManager, FeeManager, GasThrottler {
         require(msg.sender == vault, "!vault");
 
         uint256 wantBal = IERC20(want).balanceOf(address(this));
+
+        if (wantBal < _amount) {
+            IBeefyRewardPool(rewardPool).withdraw(_amount.sub(wantBal));
+            wantBal = _amount;
+        }
 
         if (wantBal > _amount) {
             wantBal = _amount;
@@ -84,7 +89,6 @@ contract StrategyCommonGauge is StratManager, FeeManager, GasThrottler {
         }
 
         IERC20(want).safeTransfer(vault, wantBal);
-
         emit Withdraw(balanceOf());
     }
 
@@ -109,17 +113,28 @@ contract StrategyCommonGauge is StratManager, FeeManager, GasThrottler {
 
     // compounds earnings and charges performance fee
     function _harvest(address callFeeRecipient) internal whenNotPaused {
-        uint256 beforeOutputBal = IERC20(output).balanceOf(address(this));
+        notifyRewardPool();
+        IBeefyRewardPool(rewardPool).getReward();
+
+        uint256 outputBal = IERC20(output).balanceOf(address(this));
+        if (outputBal > 0) {
+            chargeFees(callFeeRecipient);
+            outputBal = IERC20(output).balanceOf(address(this));
+            IVault(want).deposit(outputBal);
+            uint256 wantHarvested = balanceOfWant();
+            IBeefyRewardPool(rewardPool).stake(wantHarvested);
+
+            lastHarvest = block.timestamp;
+            emit StratHarvest(msg.sender, wantHarvested, balanceOf());
+        }
+    }
+
+    // notify rewards if available
+    function notifyRewardPool() internal {
         IGaugeStaker(gaugeStaker).claimVeWantReward();
         uint256 outputBal = IERC20(output).balanceOf(address(this));
-        require(outputBal > beforeOutputBal, "!rewards");
-
-        chargeFees(callFeeRecipient);
-        uint256 depositBal = depositUnderlying();
-        wantLocked = wantLockedLeft().add(depositBal);
-
-        lastHarvest = block.timestamp;
-        emit StratHarvest(msg.sender, depositBal, balanceOf());
+        IERC20(output).safeTransfer(rewardPool, outputBal);
+        IBeefyRewardPool(rewardPool).notifyRewardAmount(outputBal);
     }
 
     // performance fees
@@ -139,16 +154,9 @@ contract StrategyCommonGauge is StratManager, FeeManager, GasThrottler {
         IERC20(native).safeTransfer(strategist, strategistFee);
     }
 
-    // Deposits underlying token to get more want.
-    function depositUnderlying() internal returns (uint256) {
-        uint256 outputBal = IERC20(output).balanceOf(address(this));
-        IVault(want).deposit(outputBal);
-        return outputBal;
-    }
-
-    // calculate the total underlaying 'want' held by the strat, minus any pending rewards.
+    // calculate the total underlaying 'want' held by the strat
     function balanceOf() public view returns (uint256) {
-        return balanceOfWant().sub(wantLockedLeft());
+        return balanceOfWant().add(balanceOfPool());
     }
 
     // it calculates how much 'want' this contract holds.
@@ -156,33 +164,18 @@ contract StrategyCommonGauge is StratManager, FeeManager, GasThrottler {
         return IERC20(want).balanceOf(address(this));
     }
 
-    // remaining want rewards not yet distributed on this contract.
-    // linear distribution over 1 week.
-    function wantLockedLeft() public view returns (uint256) {
-        return wantLocked.mul(getMultiplier(block.timestamp, lastHarvest.add(WEEK))).div(WEEK);
-    }
-
-    // return reward multiplier over the given _from to _to block.
-    function getMultiplier(uint256 _from, uint256 _to) internal pure returns (uint256) {
-        if (_to < _from) {
-            return 0;
-        }
-        return _to.sub(_from);
-    }
-
-    // annual percentage rate in 18 decimals.
-    function apr() external view returns (uint256) {
-        return wantLocked.mul(1e18).div(balanceOf()).mul(WEEKS_IN_YEAR);
+    // it calculates how much 'want' the strategy has working in the farm.
+    function balanceOfPool() public view returns (uint256) {
+        return IBeefyRewardPool(rewardPool).balanceOf(address(this));
     }
 
     // returns rewards unharvested
-    function rewardsAvailable() public returns (uint256) {
-        IGaugeStaker(gaugeStaker).claimVeWantReward();
-        return IERC20(output).balanceOf(address(this));
+    function rewardsAvailable() public view returns (uint256) {
+        return IBeefyRewardPool(rewardPool).earned(address(this));
     }
 
     // native reward amount for calling harvest
-    function callReward() public returns (uint256) {
+    function callReward() public view returns (uint256) {
         uint256 outputBal = rewardsAvailable();
         uint256 nativeOut;
         if (outputBal > 0) {
@@ -211,21 +204,12 @@ contract StrategyCommonGauge is StratManager, FeeManager, GasThrottler {
         shouldGasThrottle = _shouldGasThrottle;
     }
 
-    // notify the contract of any rewards outside of fee distribution.
-    // extend the lock for another week.
-    function notifyRewards(bool _chargeFees) external onlyManager {
-        if (_chargeFees) {
-            chargeFees(tx.origin);
-        }
-        uint256 depositBal = depositUnderlying();
-        wantLocked = wantLockedLeft().add(depositBal);
-        lastHarvest = block.timestamp;
-        emit NotifyRewards(depositBal, balanceOf());
-    }
-
     // called as part of strat migration. Sends all the available funds back to the vault.
     function retireStrat() external {
         require(msg.sender == vault, "!vault");
+
+        uint256 depositBal = IBeefyRewardPool(rewardPool).balanceOf(address(this));
+        IBeefyRewardPool(rewardPool).withdraw(depositBal);
 
         uint256 wantBal = IERC20(want).balanceOf(address(this));
         IERC20(want).transfer(vault, wantBal);
@@ -234,6 +218,9 @@ contract StrategyCommonGauge is StratManager, FeeManager, GasThrottler {
     // pauses deposits and withdraws all funds from third party systems.
     function panic() public onlyManager {
         pause();
+
+        uint256 depositBal = IBeefyRewardPool(rewardPool).balanceOf(address(this));
+        IBeefyRewardPool(rewardPool).withdraw(depositBal);
     }
 
     function pause() public onlyManager {
@@ -253,14 +240,29 @@ contract StrategyCommonGauge is StratManager, FeeManager, GasThrottler {
     function _giveAllowances() internal {
         IERC20(output).safeApprove(unirouter, uint256(-1));
         IERC20(output).safeApprove(want, uint256(-1));
+        IERC20(want).safeApprove(rewardPool, uint256(-1));
     }
 
     function _removeAllowances() internal {
         IERC20(output).safeApprove(unirouter, 0);
         IERC20(output).safeApprove(want, 0);
+        IERC20(want).safeApprove(rewardPool, 0);
     }
 
     function outputToNative() external view returns (address[] memory) {
         return outputToNativeRoute;
+    }
+
+    function transferOwnershipRewardPool(address _owner) external onlyOwner {
+        IBeefyRewardPool(rewardPool).transferOwnership(_owner);
+    }
+
+    function inCaseTokensGetStuckRewardPool(address _token) external onlyOwner {
+        require(_token != want, "!want");
+        require(_token != output, "!output");
+
+        IBeefyRewardPool(rewardPool).inCaseTokensGetStuck(_token);
+        uint256 amount = IERC20(_token).balanceOf(address(this));
+        IERC20(_token).safeTransfer(msg.sender, amount);
     }
 }

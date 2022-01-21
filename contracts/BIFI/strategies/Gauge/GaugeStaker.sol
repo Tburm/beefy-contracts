@@ -3,11 +3,13 @@
 pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 
 import "../../interfaces/common/gauge/IVeWant.sol";
 import "./GaugeManager.sol";
 
-contract GaugeStaker is GaugeManager {
+contract GaugeStaker is ERC20Upgradeable, ReentrancyGuardUpgradeable, GaugeManager {
     using SafeERC20Upgradeable for IERC20Upgradeable;
     using SafeMathUpgradeable for uint256;
 
@@ -17,13 +19,8 @@ contract GaugeStaker is GaugeManager {
 
     uint256 private constant MAXTIME = 4 * 364 * 86400;
     uint256 private constant WEEK = 7 * 86400;
-    bool private lockInitialized;
-
-    // Locked balance in the contract
-    uint256 public lockedWant;
 
     event DepositWant(uint256 tvl);
-    event WithdrawWant(uint256 tvl);
     event Vote(address[] tokenVote, uint256[] weights);
     event RecoverTokens(address token, uint256 amount);
 
@@ -32,11 +29,15 @@ contract GaugeStaker is GaugeManager {
         address _feeDistributor,
         address _gaugeProxy,
         address _keeper,
-        address _vault
+        address _rewardPool,
+        string memory _name,
+        string memory _symbol
     ) public initializer {
-        managerInitialize(_feeDistributor, _gaugeProxy, _keeper, _vault);
+        managerInitialize(_feeDistributor, _gaugeProxy, _keeper, _rewardPool);
         veWant = IVeWant(_veWant);
         want = IERC20Upgradeable(veWant.token());
+
+        __ERC20_init(_name, _symbol);
 
         want.safeApprove(address(veWant), type(uint256).max);
     }
@@ -47,56 +48,51 @@ contract GaugeStaker is GaugeManager {
         emit Vote(_tokenVote, _weights);
     }
 
+    // helper function for depositing full balance of want
+    function depositAll() external {
+        _deposit(msg.sender, want.balanceOf(msg.sender));
+    }
+
+    // deposit an amount of want
+    function deposit(uint256 _amount) external {
+        _deposit(msg.sender, _amount);
+    }
+
+    // deposit an amount of want on behalf of an address
+    function depositFor(address _user, uint256 _amount) external {
+        _deposit(_user, _amount);
+    }
+
     // deposit 'want' and lock
-    function deposit() external whenNotPaused {
-        uint256 wantBal = balanceOfWant();
-        if (wantBal > 0) {
+    function _deposit(address _user, uint256 _amount) internal nonReentrant whenNotPaused {
+        uint256 _pool = balanceOfWant();
+        want.safeTransferFrom(msg.sender, address(this), _amount);
+        uint256 _after = balanceOfWant();
+        _amount = _after.sub(_pool); // Additional check for deflationary tokens
+        if (_amount > 0) {
             if (balanceOfVe() > 0) {
-                lockedWant += wantBal;
-                veWant.increase_amount(wantBal);
+                increaseUnlockTime();
+                veWant.increase_amount(_amount);
             } else {
                 _createLock();
             }
-            emit DepositWant(balanceOf());
+            _mint(_user, _amount);
+            emit DepositWant(balanceOfVe());
         }
     }
 
-    // withdraw 'want' after lock has expired
-    function withdraw(uint256 _amount) external onlyVault {
-        require(balanceOfVe() == 0, "lock not expired");
-        uint256 wantBal = balanceOfWant();
-
-        if (wantBal < _amount) {
-            veWant.withdraw();
-            lockedWant = 0;
-            lockInitialized = false;
-            wantBal = balanceOfWant();
-        }
-
-        if (wantBal > _amount) {
-            wantBal = _amount;
-        }
-
-        want.safeTransfer(vault, wantBal);
-
-        emit WithdrawWant(balanceOf());
-    }
-
-    // extend lock time before deposit
-    function beforeDeposit() external override onlyVault {
+    // increase the lock period
+    function increaseUnlockTime() public {
         uint256 _newUnlockTime = newUnlockTime();
-        if (_newUnlockTime > currentUnlockTime() && extendLockTime && lockInitialized) {
+        if (_newUnlockTime > currentUnlockTime()) {
             veWant.increase_unlock_time(_newUnlockTime);
         }
     }
 
+    // create a new lock
     function _createLock() internal {
-        if (extendLockTime) {
-            veWant.withdraw();
-            lockedWant = balanceOfWant();
-            lockInitialized = true;
-            veWant.create_lock(lockedWant, newUnlockTime());
-        }
+        veWant.withdraw();
+        veWant.create_lock(balanceOfWant(), newUnlockTime());
     }
 
     // timestamp at which 'want' is unlocked
@@ -107,11 +103,6 @@ contract GaugeStaker is GaugeManager {
     // new unlock timestamp rounded down to start of the week
     function newUnlockTime() internal view returns (uint256) {
         return block.timestamp.add(MAXTIME).div(WEEK).mul(WEEK);
-    }
-
-    // calculate how much total 'want' is held by the staker
-    function balanceOf() public view returns (uint256) {
-        return lockedWant.add(balanceOfWant());
     }
 
     // calculate how much 'want' is held by this contract
@@ -137,19 +128,22 @@ contract GaugeStaker is GaugeManager {
     }
 
     // pass through a deposit to a gauge
-    function deposit(address _gauge, address _underlying, uint256 _amount) external onlyStrategy {
+    function deposit(address _gauge, uint256 _amount) external onlyWhitelist(_gauge) {
+        address _underlying = IGauge(_gauge).TOKEN();
         IERC20Upgradeable(_underlying).safeTransferFrom(msg.sender, address(this), _amount);
         IGauge(_gauge).deposit(_amount);
     }
 
     // pass through a withdrawal from a gauge
-    function withdraw(address _gauge, address _underlying, uint256 _amount) external onlyStrategy {
+    function withdraw(address _gauge, uint256 _amount) external onlyWhitelist(_gauge) {
+        address _underlying = IGauge(_gauge).TOKEN();
         IGauge(_gauge).withdraw(_amount);
         IERC20Upgradeable(_underlying).safeTransfer(msg.sender, _amount);
     }
 
     // pass through a full withdrawal from a gauge
-    function withdrawAll(address _gauge, address _underlying) external onlyStrategy {
+    function withdrawAll(address _gauge) external onlyWhitelist(_gauge) {
+        address _underlying = IGauge(_gauge).TOKEN();
         uint256 _before = IERC20Upgradeable(_underlying).balanceOf(address(this));
         IGauge(_gauge).withdrawAll();
         uint256 _balance = IERC20Upgradeable(_underlying).balanceOf(address(this)).sub(_before);
@@ -157,7 +151,7 @@ contract GaugeStaker is GaugeManager {
     }
 
     // pass through rewards from a gauge
-    function claimGaugeReward(address _gauge) external onlyStrategy {
+    function claimGaugeReward(address _gauge) external onlyWhitelist(_gauge) {
         uint256 _before = balanceOfWant();
         IGauge(_gauge).getReward();
         uint256 _balance = balanceOfWant().sub(_before);
@@ -165,7 +159,7 @@ contract GaugeStaker is GaugeManager {
     }
 
     // pass through rewards from the fee distributor
-    function claimVeWantReward() external onlyStrategy {
+    function claimVeWantReward() external onlyRewardPool {
         uint256 _before = balanceOfWant();
         feeDistributor.claim();
         uint256 _balance = balanceOfWant().sub(_before);

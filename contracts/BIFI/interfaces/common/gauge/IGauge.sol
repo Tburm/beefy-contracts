@@ -10,4 +10,5 @@ interface IGauge {
     function earned(address _account) external view returns (uint256);
     function getReward() external;
     function vote(address[] calldata _tokenVote, uint256[] calldata _weights) external;
+    function TOKEN() external view returns (address);
 }

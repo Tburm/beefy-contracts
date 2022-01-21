@@ -19,36 +19,35 @@ contract GaugeManager is Initializable, OwnableUpgradeable, PausableUpgradeable 
      * {feeDistributor} - Address of the fee distributor for veWant rewards.
      * {gaugeProxy} - Address for voting on gauge weightings.
      * {keeper} - Address to manage a few lower risk features of the strat.
-     * {vault} - Address of the vault that controls the strategy's funds.
+     * {rewardPool} - Address for distributing locked want rewards.
      */
     IVeWantFeeDistributor public feeDistributor;
     IGauge public gaugeProxy;
     address public keeper;
-    address public vault;
+    address public rewardPool;
 
-    mapping(address => bool) isStrategy;
-    bool public extendLockTime;
+    mapping(address => address) whitelistedStrategy;
+    mapping(address => address) replacementStrategy;
 
     /**
      * @dev Initializes the base strategy.
      * @param _feeDistributor address of veWant fee distributor.
      * @param _gaugeProxy address of gauge proxy to vote on.
      * @param _keeper address to use as alternative owner.
-     * @param _vault address of parent vault.
+     * @param _rewardPool address of reward pool.
      */
     function managerInitialize(
         address _feeDistributor,
         address _gaugeProxy,
         address _keeper,
-        address _vault
+        address _rewardPool
     ) internal initializer {
         __Ownable_init();
 
         feeDistributor = IVeWantFeeDistributor(_feeDistributor);
         gaugeProxy = IGauge(_gaugeProxy);
         keeper = _keeper;
-        vault = _vault;
-        extendLockTime = true;
+        rewardPool = _rewardPool;
     }
 
     // checks that caller is either owner or keeper.
@@ -57,15 +56,15 @@ contract GaugeManager is Initializable, OwnableUpgradeable, PausableUpgradeable 
         _;
     }
 
-    // checks that caller is the vault.
-    modifier onlyVault {
-        require(msg.sender == vault, "!vault");
+    // checks that caller is the strategy assigned to a specific gauge.
+    modifier onlyWhitelist(address _gauge) {
+        require(whitelistedStrategy[_gauge] == msg.sender, "!whitelisted");
         _;
     }
 
-    // checks that caller is the strategy.
-    modifier onlyStrategy {
-        require(isStrategy[msg.sender], "!strategy");
+    // checks that caller is the reward pool.
+    modifier onlyRewardPool() {
+        require(msg.sender == rewardPool, "!rewardPool");
         _;
     }
 
@@ -94,55 +93,53 @@ contract GaugeManager is Initializable, OwnableUpgradeable, PausableUpgradeable 
     }
 
     /**
-     * @dev Updates parent vault.
-     * @param _vault new vault address.
+     * @dev Updates address where reward pool where want is rewarded.
+     * @param _rewardPool new reward pool address.
      */
-    function setVault(address _vault) external onlyOwner {
-        vault = _vault;
-    }
-
-    /**
-     * @dev Turns on or off extending lock time for veWant.
-     * @param _extendLockTime boolean for extending locks.
-     */
-    function setExtendLockTime(bool _extendLockTime) external onlyManager {
-        extendLockTime = _extendLockTime;
+    function setRewardPool(address _rewardPool) external onlyOwner {
+        rewardPool = _rewardPool;
     }
 
      /**
      * @dev Whitelists a strategy address to interact with the Gauge Staker and gives approvals.
      * @param _strategy new strategy address.
-     * @param _approveGauge boolean for giving approvals for the gauge.
      */
-    function whitelistStrategy(address _strategy, bool _approveGauge) external onlyOwner {
-        isStrategy[_strategy] = true;
+    function whitelistStrategy(address _strategy) external onlyManager {
+        IERC20Upgradeable _want = IGaugeStrategy(_strategy).want();
+        address _gauge = IGaugeStrategy(_strategy).gauge();
+        require(IGauge(_gauge).balanceOf(address(this)) == 0, '!inactive');
 
-        if (_approveGauge) {
-            IERC20Upgradeable _want = IGaugeStrategy(_strategy).want();
-            address _gauge = IGaugeStrategy(_strategy).gauge();
-            _want.safeApprove(_gauge, 0);
-            _want.safeApprove(_gauge, type(uint256).max);
-        }
+        _want.safeApprove(_gauge, 0);
+        _want.safeApprove(_gauge, type(uint256).max);
+        whitelistedStrategy[_gauge] = _strategy;
     }
 
     /**
      * @dev Removes a strategy address from the whitelist and remove approvals.
      * @param _strategy remove strategy address from whitelist.
-     * @param _disapproveGauge boolean for removing approvals for the gauge.
      */
-    function blacklistStrategy(address _strategy, bool _disapproveGauge) external onlyManager {
-        isStrategy[_strategy] = false;
-
-        if (_disapproveGauge) {
-            IERC20Upgradeable _want = IGaugeStrategy(_strategy).want();
-            address _gauge = IGaugeStrategy(_strategy).gauge();
-            _want.safeApprove(_gauge, 0);
-        }
+    function blacklistStrategy(address _strategy) external onlyManager {
+        IERC20Upgradeable _want = IGaugeStrategy(_strategy).want();
+        address _gauge = IGaugeStrategy(_strategy).gauge();
+        _want.safeApprove(_gauge, 0);
+        whitelistedStrategy[_gauge] = address(0);
     }
 
     /**
-     * @dev Function to synchronize balances before new user deposit.
-     * Can be overridden in the strategy.
+     * @dev Prepare a strategy to be retired and replaced with another.
+     * @param _oldStrategy strategy to be replaced.
+     * @param _newStrategy strategy to be implemented.
      */
-    function beforeDeposit() external virtual {}
+    function proposeStrategy(address _oldStrategy, address _newStrategy) external onlyManager {
+        require(IGaugeStrategy(_oldStrategy).gauge() == IGaugeStrategy(_newStrategy).gauge(), '!gauge');
+        replacementStrategy[_oldStrategy] = _newStrategy;
+    }
+
+    /**
+     * @dev Switch over whitelist from one strategy to another for a gauge.
+     * @param _gauge gauge for which the new strategy will be whitelisted.
+     */
+    function upgradeStrategy(address _gauge) external onlyWhitelist(_gauge) {
+        whitelistedStrategy[_gauge] = replacementStrategy[msg.sender];
+    }
 }

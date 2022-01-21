@@ -83,7 +83,7 @@ contract StrategyCommonGaugeLP is StratManager, FeeManager, GasThrottler {
         uint256 wantBal = IERC20(want).balanceOf(address(this));
 
         if (wantBal > 0) {
-            IGaugeStaker(gaugeStaker).deposit(gauge, want, wantBal);
+            IGaugeStaker(gaugeStaker).deposit(gauge, wantBal);
             emit Deposit(balanceOf());
         }
     }
@@ -94,7 +94,7 @@ contract StrategyCommonGaugeLP is StratManager, FeeManager, GasThrottler {
         uint256 wantBal = IERC20(want).balanceOf(address(this));
 
         if (wantBal < _amount) {
-            IGaugeStaker(gaugeStaker).withdraw(gauge, want, _amount.sub(wantBal));
+            IGaugeStaker(gaugeStaker).withdraw(gauge, _amount.sub(wantBal));
             wantBal = IERC20(want).balanceOf(address(this));
         }
 
@@ -235,7 +235,8 @@ contract StrategyCommonGaugeLP is StratManager, FeeManager, GasThrottler {
     function retireStrat() external {
         require(msg.sender == vault, "!vault");
 
-        IGaugeStaker(gaugeStaker).withdrawAll(gauge, want);
+        IGaugeStaker(gaugeStaker).withdrawAll(gauge);
+        IGaugeStaker(gaugeStaker).upgradeStrategy(gauge);
 
         uint256 wantBal = IERC20(want).balanceOf(address(this));
         IERC20(want).transfer(vault, wantBal);
@@ -244,7 +245,7 @@ contract StrategyCommonGaugeLP is StratManager, FeeManager, GasThrottler {
     // pauses deposits and withdraws all funds from third party systems.
     function panic() public onlyManager {
         pause();
-        IGaugeStaker(gaugeStaker).withdrawAll(gauge, want);
+        IGaugeStaker(gaugeStaker).withdrawAll(gauge);
     }
 
     function pause() public onlyManager {
